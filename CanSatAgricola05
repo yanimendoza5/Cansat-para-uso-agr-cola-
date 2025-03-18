@@ -1,0 +1,248 @@
+from machine import Pin, UART, mem32, I2C, SoftI2C
+import utime, time
+import sdcard
+import uos
+from micropyGPS import MicropyGPS
+from ulora import LoRa, ModemConfig, SPIConfig
+import bme280_float as bme280
+
+# Configuración Inicial
+cont = 0
+led = machine.Pin(25, machine.Pin.OUT) #LED a bordo
+
+# Medición de voltaje pila
+adc = machine.ADC(28)
+
+# Configuración de la SD Card
+cs = machine.Pin(13, machine.Pin.OUT)
+spi = machine.SPI(1, baudrate=1000000, polarity=0, phase=0, bits=8,
+                  firstbit=machine.SPI.MSB, sck=machine.Pin(10),
+                  mosi=machine.Pin(11), miso=machine.Pin(12))
+sd = sdcard.SDCard(spi, cs)
+vfs = uos.VfsFat(sd)
+uos.mount(vfs, "/sd")
+
+with open("/sd/CANSAT_CO2.txt", "w") as file:
+    file.write("Num   Volt   Temp   Hum   Press   Alt   CO2   Lat   Lon   Sat's\r\n")
+
+# Configuración de LoRa
+RFM95_RST = 6
+RFM95_SPIBUS = SPIConfig.rp2_0
+RFM95_CS = 5
+RFM95_INT = 7
+RF95_FREQ = 915.0
+RF95_POW = 23
+CLIENT_ADDRESS = 1
+SERVER_ADDRESS = 2
+lora = LoRa(RFM95_SPIBUS, RFM95_INT, CLIENT_ADDRESS, RFM95_CS, reset_pin=RFM95_RST, freq=RF95_FREQ, tx_power=RF95_POW, acks=True)
+
+# Configuración del GPS
+gps_module = UART(1, baudrate=9600, tx=Pin(8), rx=Pin(9))
+TIMEZONE = -6
+my_gps = MicropyGPS(TIMEZONE)
+
+def convert(parts):
+    if (parts[0] == 0):
+        return None
+    data = parts[0]+(parts[1]/60.0)
+    # parts[2] contain 'E' or 'W' or 'N' or 'S'
+    if (parts[2] == 'S'):
+        data = -data
+    if (parts[2] == 'W'):
+        data = -data
+    data = '{0:.7f}'.format(data) # to 7 decimal places
+    return str(data)
+
+# Configuración del BME280
+i2c = SoftI2C(sda=machine.Pin(14), scl=machine.Pin(15), freq=100000)
+bme = bme280.BME280(i2c=i2c)
+presion_inicial = float(bme.values[1])
+
+def calculate_altitude(P, presion_inicial):
+    return 44330 * (1.0 - (P / presion_inicial) ** 0.1903)
+
+# Configuración del sensor CM1106
+uart = machine.UART(0, baudrate=9600, tx=machine.Pin(16), rx=machine.Pin(17))
+en = Pin(18, Pin.OUT)
+rdy = Pin(19, Pin.IN)
+
+# Clase del Filtro de Kalman
+class KalmanFilter:
+    def __init__(self, process_variance, measurement_variance, estimated_measurement_variance=1.0):
+        self.process_variance = process_variance
+        self.measurement_variance = measurement_variance
+        self.estimated_measurement_variance = estimated_measurement_variance
+        self.posteri_estimate = 0.0
+        self.posteri_error_estimate = 1.0
+    
+    def update(self, measurement):
+        priori_estimate = self.posteri_estimate
+        priori_error_estimate = self.posteri_error_estimate + self.process_variance
+    
+        kalman_gain = priori_error_estimate / (priori_error_estimate + self.measurement_variance)
+        self.posteri_estimate = priori_estimate + kalman_gain * (measurement - priori_estimate)
+        self.posteri_error_estimate = (1 - kalman_gain) * priori_error_estimate
+    
+        return self.posteri_estimate
+    
+# Inicializar el filtro de Kalman
+process_variance = 1e-5
+measurement_variance = 4
+kalman_filter = KalmanFilter(process_variance, measurement_variance)
+
+# Calibración y Lectura del Sensor CM1106
+lecturas_CO2 = []
+ctrl_calib = 0
+dir1, dir2, dir3 = 0x20000000, 0x20000004, 0x20000008
+
+lora.send_to_wait("Iniciando Sensores...", SERVER_ADDRESS)
+
+while ctrl_calib < 10:
+    ctrl_calib += 1
+    en.value(1)
+    time.sleep_ms(708)
+    
+    if rdy.value() == 0:
+        comando = bytes([0x11, 0x01, 0x01, 0xED])
+        uart.write(comando)
+        time.sleep_ms(6)
+        
+    respuesta = uart.read(8)
+    time.sleep_ms(1)
+    
+    if respuesta and len(respuesta) == 8:
+        for i in range(len(respuesta)):
+            if respuesta[i] == 0x16:
+                datos_ordenados = respuesta[i:] + respuesta[:i]
+                break
+        
+        checksum = sum(datos_ordenados[:7])
+        if (0xFF - checksum + 1) == datos_ordenados[7]:
+            if datos_ordenados[0] == 0x16 and datos_ordenados[1] == 0x05 and datos_ordenados[2] == 0x01:
+                CO2 = datos_ordenados[3] * 256 + datos_ordenados[4]
+                
+                # Aplicar el filtro de Kalman
+                lectura_filtrada = 
+kalman_filter.update(CO2)
+                # Convertir la lectura filtrada a un entero
+                lectura_filtrada_int = int(lectura_filtrada)
+                lecturas_CO2.append(lectura_filtrada_int)
+                print(f"{ctrl_calib} Concentración de CO2: {lectura_filtrada_int} ppm")
+            else:
+                print("Error en la lectura del sensor")
+        else:
+            ctrl_calib -= 1
+            
+    en.value(0)
+    time.sleep_ms(10)
+
+if len(lecturas_CO2) == 10:
+    #menor_CO2 = min(lecturas_CO2)
+    suma_CO2 = sum(lecturas_CO2)
+    promedio_CO2 = suma_CO2 / 10
+    menor_CO2 = int(promedio_CO2)
+    if menor_CO2 < 416:
+        calib1, calib2, calib3 = 416 - menor_CO2, 1, menor_CO2
+    else:
+        calib1, calib2, calib3 = menor_CO2 - 416, 2, menor_CO2
+        
+    mem32[dir1], mem32[dir2], mem32[dir3] = calib1, calib2, calib3
+    
+    print(f'El valor más pequeño de CO2 es: {menor_CO2}')
+    print(f'val1: {mem32[dir1]}')
+    print(f'Val2: {mem32[dir2]}')
+    print(f'Val3: {mem32[dir3]}')
+    print("saliendo de bucle")
+    lora.send_to_wait("Sensores Iniciados", SERVER_ADDRESS)
+
+def leer_CO2():
+    en.value(1)
+    time.sleep_ms(708)
+    
+    if rdy.value() == 0:
+        comando = bytes([0x11, 0x01, 0x01, 0xED])
+        uart.write(comando)
+        time.sleep_ms(6)
+    
+    respuesta = uart.read(8)
+    time.sleep_ms(1)
+    
+    if respuesta and len(respuesta) == 8:
+        for i in range(len(respuesta)):
+            if respuesta[i] == 0x16:
+                datos_ordenados = respuesta[i:] + respuesta[:i]
+                break
+        
+        checksum = sum(datos_ordenados[:7])
+        if (0xFF - checksum + 1) == datos_ordenados[7]:
+            if datos_ordenados[0] == 0x16 and datos_ordenados[1] == 0x05 and datos_ordenados[2] == 0x01:
+                CO2 = datos_ordenados[3] * 256 + datos_ordenados[4]
+                
+                # Aplicar el filtro de Kalman
+                lectura_filtrada = kalman_filter.update(CO2)
+                
+                # Leer los valores de las direcciones de memoria PARA PRUEBAS:
+                val1 = mem32[dir1]
+                val2 = mem32[dir2]
+                val3 = mem32[dir3]
+                if val2 == 1:
+                    lectura = lectura_filtrada + val1
+                if val2 == 2:
+                    lectura = lectura_filtrada - val1
+                # Convertir lectura a cadena               
+                return str(int(lectura))
+    en.value(0)
+    return None
+
+while True:
+    
+    cont += 1
+
+    # Leer el valor ADC y calcular el voltaje
+    adc_value = adc.read_u16()
+    V = adc_value * 3.3 / 65535
+        
+    # Leer datos del BME280 y calcular la altura
+    bme_data = bme.values
+    T, H, P = float(bme_data[0]), float(bme_data[2]), float(bme_data[1])
+    A = calculate_altitude(P, presion_inicial)
+        
+    # Leer CO2
+    Dx = leer_CO2()
+    
+    # Leer datos del GPS
+    length = gps_module.any()
+    if length > 0:
+        b = gps_module.read(length)
+        for x in b:
+            my_gps.update(chr(x))
+    
+    latitude, longitude = convert(my_gps.latitude), convert(my_gps.longitude)
+    lat = '{0:.7f}'.format(my_gps.latitude[0] + my_gps.latitude[1] / 60.0)
+    lon = '{0:.7f}'.format(my_gps.longitude[0] + my_gps.longitude[1] / 60.0)
+    S = my_gps.satellites_in_view
+    
+    # Impresión de datos en consola para comprobación
+    cadena = f"{cont},{V},{T},{H},{P},{A},{Dx},{latitude},{longitude},{S}"
+    print(cadena) #DESCOMENTAR SI QUIEREN VER LOS DATOS EN CONSOLA
+
+    # Transmisión LoRa
+    lora.send_to_wait(cadena, SERVER_ADDRESS)
+    
+    #Señalización con Led a bordo
+    led.toggle()
+
+    # Escribir datos en la SD Card
+    with open("/sd/CANSAT_CO2.txt", "a") as file:
+        file.write(cadena + " \r\n ")
+        file.write(" \r\n ")
+        file.close()
+        
+    utime.sleep(0.05)
+
+###PARA MEDICION DE TIEMPOS DE EJECUCION, UTILIZAR:
+    #start_time = utime.ticks_ms()
+    #end_time = utime.ticks_ms()
+    #elapsed_time = utime.ticks_diff(end_time, start_time)
+    #print(f"Tiempo de ejecución del bucle: {elapsed_time} ms")
+####
